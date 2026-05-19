@@ -6,12 +6,16 @@ import random
 
 from synth import (
     ACCIDENTAL_CYCLE,
+    INSTRUMENTS,
+    INSTRUMENT_NAMES,
     MIDI_HIGH,
     MIDI_LOW,
     NAME_TO_PITCH_CLASS,
     NOTE_NAMES,
+    fluidsynth_available,
     generate_chord_wav,
     generate_wav,
+    instrument_range,
     midi_to_name,
     midi_to_pitch_class,
     play_wav_async,
@@ -228,6 +232,62 @@ def note_selection_screen(stdscr, enabled_pcs):
                 return selected
 
 
+# ── Instrument selection view ──────────────────────────────────────────
+
+def instrument_selection_screen(stdscr, current_instrument):
+    """Select an instrument. Returns index into INSTRUMENTS or None for synth.
+    current_instrument is the current index or None."""
+    BOX_W = 50
+    BOX_H = 15
+
+    has_fs = fluidsynth_available()
+
+    # Options: "Synth (built-in)" + all instruments
+    options = ["Synth (built-in)"] + [name for _, name, _, _ in INSTRUMENTS]
+    cursor = 0 if current_instrument is None else current_instrument + 1
+
+    while True:
+        stdscr.erase()
+        y0, x0 = 1, 2
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "INSTRUMENT", curses.A_BOLD)
+
+        if not has_fs:
+            safe_addstr(stdscr, y0 + 1, x0 + 15,
+                        "(no SoundFont found)", curses.A_NORMAL)
+
+        for i, label in enumerate(options):
+            r = y0 + 3 + i
+            if r >= y0 + BOX_H - 3:
+                break
+            marker = " > " if i == cursor else "   "
+            attr = curses.A_BOLD if i == cursor else curses.A_NORMAL
+            # Dim instruments if fluidsynth not available
+            if i > 0 and not has_fs:
+                attr = curses.A_DIM
+            safe_addstr(stdscr, r, x0 + 2, f"{marker}{label}", attr)
+
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2,
+                    "[j/\u2193 k/\u2191] select  [Enter] confirm")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] cancel")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return current_instrument
+        elif is_up(key):
+            cursor = (cursor - 1) % len(options)
+        elif is_down(key):
+            cursor = (cursor + 1) % len(options)
+        elif key in (ord("\n"), ord("\r")):
+            if cursor == 0:
+                return None  # built-in synth
+            if not has_fs:
+                continue  # can't select instruments without fluidsynth
+            return cursor - 1  # index into INSTRUMENTS
+
+
 # ── Chord selection view ───────────────────────────────────────────────
 
 def chord_selection_screen(stdscr, enabled_chords, enabled_inversions):
@@ -336,6 +396,7 @@ def chord_selection_screen(stdscr, enabled_chords, enabled_inversions):
 def note_training(stdscr):
     """Single-note ear training loop."""
     enabled_pcs = set(range(12))  # all notes enabled
+    instrument = None  # None = built-in synth
     correct = 0
     total = 0
     current_note = None
@@ -345,18 +406,19 @@ def note_training(stdscr):
     feedback_attr = curses.A_NORMAL
 
     BOX_W = 50
-    BOX_H = 11
+    BOX_H = 12
 
     def pick_note():
         nonlocal current_note
+        lo, hi = instrument_range(instrument)
         while True:
-            n = random.randint(MIDI_LOW, MIDI_HIGH)
+            n = random.randint(lo, hi)
             if midi_to_pitch_class(n) in enabled_pcs:
                 current_note = n
                 return
 
     def play_current():
-        path = generate_wav(current_note)
+        path = generate_wav(current_note, instrument)
         play_wav_async(path)
 
     def get_answer_str():
@@ -383,6 +445,11 @@ def note_training(stdscr):
         feedback_attr = curses.A_BOLD
         return True
 
+    def instrument_label():
+        if instrument is None:
+            return "Synth"
+        return INSTRUMENT_NAMES[instrument]
+
     def render():
         stdscr.erase()
         y0, x0 = 1, 2
@@ -404,12 +471,13 @@ def note_training(stdscr):
             safe_addstr(stdscr, row, x0 + 2, feedback[:BOX_W - 4], feedback_attr)
             row += 1
 
-        safe_addstr(stdscr, row, x0 + 2, "\u266a Listen...", curses.A_NORMAL)
+        safe_addstr(stdscr, row, x0 + 2, f"\u266a Listen...  ({instrument_label()})")
         row += 2
         safe_addstr(stdscr, row, x0 + 2, f"Your answer:  {get_answer_str()}")
 
-        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[A-G] note  [Tab] #/b  [Enter] submit")
-        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[R] replay  [N] note selection")
+        safe_addstr(stdscr, y0 + BOX_H - 5, x0 + 2, "[A-G] note  [Tab] #/b  [Enter] submit")
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[R] replay  [N] note selection")
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[I] instrument")
         safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
         stdscr.refresh()
 
@@ -424,9 +492,13 @@ def note_training(stdscr):
             return
         elif key in (ord("n"), ord("N")):
             enabled_pcs = note_selection_screen(stdscr, enabled_pcs)
-            # Pick a new note from the updated selection
             answer_letter = ""
             accidental_idx = 0
+            feedback = ""
+            pick_note()
+            play_current()
+        elif key in (ord("i"), ord("I")):
+            instrument = instrument_selection_screen(stdscr, instrument)
             feedback = ""
             pick_note()
             play_current()
@@ -458,6 +530,7 @@ def chord_training(stdscr):
     """Chord recognition ear training loop."""
     enabled_chords = set(ALL_CHORD_TYPES)
     enabled_inversions = {0, 1, 2}  # root, 1st, 2nd (3rd only for 7ths)
+    instrument = None  # None = built-in synth
 
     correct = 0
     total = 0
@@ -475,7 +548,12 @@ def chord_training(stdscr):
     focus = 0  # 0 = quality, 1 = inversion
 
     BOX_W = 50
-    BOX_H = 12
+    BOX_H = 13
+
+    def instrument_label():
+        if instrument is None:
+            return "Synth"
+        return INSTRUMENT_NAMES[instrument]
 
     def pick_chord():
         nonlocal current_root, current_type, current_inv
@@ -492,22 +570,23 @@ def chord_training(stdscr):
             valid_invs = [0]
         current_inv = random.choice(valid_invs)
 
-        # Pick a root that keeps all chord notes in piano range
+        # Pick a root that keeps all chord notes in instrument range
         intervals = list(CHORD_INTERVALS[current_type])
         if current_inv > 0:
             for _ in range(current_inv):
                 intervals.append(intervals.pop(0) + 12)
         max_interval = max(intervals)
 
-        lo = 36  # C2 — chords below this are inaudible on most headphones
-        hi = MIDI_HIGH - max_interval
+        inst_lo, inst_hi = instrument_range(instrument)
+        lo = max(inst_lo, 36)  # at least C2 for audibility
+        hi = inst_hi - max_interval
         if hi < lo:
             hi = lo
         current_root = random.randint(lo, hi)
 
     def play_current():
         notes = build_chord_midi(current_root, current_type, current_inv)
-        path = generate_chord_wav(notes)
+        path = generate_chord_wav(notes, instrument)
         play_wav_async(path)
 
     def check_answer():
@@ -551,7 +630,7 @@ def chord_training(stdscr):
             safe_addstr(stdscr, row, x0 + 2, feedback[:BOX_W - 4], feedback_attr)
             row += 1
 
-        safe_addstr(stdscr, row, x0 + 2, "\u266a Listen...")
+        safe_addstr(stdscr, row, x0 + 2, f"\u266a Listen...  ({instrument_label()})")
         row += 2
 
         # Quality selector
@@ -566,8 +645,9 @@ def chord_training(stdscr):
         safe_addstr(stdscr, row, x0 + 24, "Inversion: ", curses.A_NORMAL)
         safe_addstr(stdscr, row, x0 + 35, i_label, i_attr)
 
-        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[Tab] field  [j/\u2193 k/\u2191] cycle  [Enter] submit")
-        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[R] replay  [N] chord selection")
+        safe_addstr(stdscr, y0 + BOX_H - 5, x0 + 2, "[Tab] field  [j/\u2193 k/\u2191] cycle  [Enter] submit")
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[R] replay  [N] chord selection")
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[I] instrument")
         safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
         stdscr.refresh()
 
@@ -587,6 +667,11 @@ def chord_training(stdscr):
             feedback = ""
             answer_type_idx = 0
             answer_inv_idx = 0
+            pick_chord()
+            play_current()
+        elif key in (ord("i"), ord("I")):
+            instrument = instrument_selection_screen(stdscr, instrument)
+            feedback = ""
             pick_chord()
             play_current()
         elif key == ord("\t"):

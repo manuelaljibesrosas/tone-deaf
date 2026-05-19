@@ -1,11 +1,14 @@
-"""Shared audio synthesis and playback utilities for tone-dear."""
+"""Shared audio synthesis and playback utilities for tone-deaf."""
 
 import math
 import os
+import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
+import urllib.request
 
 SAMPLE_RATE = 44100
 BASE_DURATION = 2.0
@@ -36,6 +39,192 @@ NAME_TO_PITCH_CLASS = {
 
 ACCIDENTAL_CYCLE = ["", "#", "b"]
 
+# ── Instruments (GM program, name, MIDI low, MIDI high) ───────────────
+
+INSTRUMENTS = [
+    (0,  "Piano",      21, 108),  # A0–C8
+    (24, "Guitar",     40,  88),  # E2–E6
+    (40, "Violin",     55, 105),  # G3–A7
+    (42, "Cello",      36,  76),  # C2–E5
+    (56, "Trumpet",    54,  86),  # F#3–D6
+    (65, "Alto Sax",   49,  80),  # Db3–Ab5
+    (73, "Flute",      60,  98),  # C4–D7
+    (11, "Vibraphone", 53,  89),  # F3–F6
+]
+
+INSTRUMENT_NAMES = [name for _, name, _, _ in INSTRUMENTS]
+
+
+def instrument_range(idx):
+    """Return (midi_low, midi_high) for an instrument index, or full piano range if None."""
+    if idx is None:
+        return (MIDI_LOW, MIDI_HIGH)
+    _, _, lo, hi = INSTRUMENTS[idx]
+    return (lo, hi)
+
+# ── SoundFont discovery ───────────────────────────────────────────────
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SOUNDFONT_SEARCH_PATHS = [
+    os.path.join(_SCRIPT_DIR, "soundfonts"),
+    "/usr/share/sounds/sf2",
+    "/usr/share/soundfonts",
+    os.path.expanduser("~/.local/share/soundfonts"),
+]
+
+# Also check brew's fluidsynth share
+_brew_sf2 = shutil.which("fluidsynth")
+if _brew_sf2:
+    _brew_prefix = os.path.dirname(os.path.dirname(os.path.realpath(_brew_sf2)))
+    _SOUNDFONT_SEARCH_PATHS.append(os.path.join(_brew_prefix, "share", "fluid-synth", "sf2"))
+
+
+def _find_soundfont():
+    """Search for a .sf2 file in known locations."""
+    for d in _SOUNDFONT_SEARCH_PATHS:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".sf2") and not f.startswith("."):
+                return os.path.join(d, f)
+    return None
+
+
+_SOUNDFONT_URL = (
+    "https://github.com/mrbumpy409/GeneralUser-GS/raw/main/GeneralUser-GS.sf2"
+)
+_SOUNDFONT_FILENAME = "GeneralUser-GS.sf2"
+
+
+def _download_soundfont():
+    """Download GeneralUser-GS SoundFont to the local soundfonts directory.
+    Returns the path on success, None on failure."""
+    dest_dir = os.path.join(_SCRIPT_DIR, "soundfonts")
+    dest_path = os.path.join(dest_dir, _SOUNDFONT_FILENAME)
+    tmp_path = dest_path + ".downloading"
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        print(
+            "Downloading SoundFont (GeneralUser-GS, ~31MB)... ",
+            end="", flush=True, file=sys.stderr,
+        )
+        urllib.request.urlretrieve(_SOUNDFONT_URL, tmp_path)
+        os.rename(tmp_path, dest_path)
+        print("done.", file=sys.stderr)
+        return dest_path
+    except Exception:
+        # Clean up partial download
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        print("failed.", file=sys.stderr)
+        return None
+
+
+_cached_soundfont = None
+_soundfont_searched = False
+
+
+def has_fluidsynth():
+    """Check if FluidSynth is available."""
+    return shutil.which("fluidsynth") is not None
+
+
+def get_soundfont():
+    """Get the path to the SoundFont file, downloading if necessary."""
+    global _cached_soundfont, _soundfont_searched
+    if _soundfont_searched:
+        return _cached_soundfont
+    _soundfont_searched = True
+    _cached_soundfont = _find_soundfont()
+    if _cached_soundfont is None and has_fluidsynth():
+        _cached_soundfont = _download_soundfont()
+    return _cached_soundfont
+
+
+def fluidsynth_available():
+    """Check if FluidSynth can be used (binary + soundfont)."""
+    return has_fluidsynth() and get_soundfont() is not None
+
+
+# ── MIDI file generation ──────────────────────────────────────────────
+
+def _write_var_len(val):
+    """Encode an integer as MIDI variable-length quantity."""
+    result = []
+    result.append(val & 0x7f)
+    val >>= 7
+    while val:
+        result.append((val & 0x7f) | 0x80)
+        val >>= 7
+    return bytes(reversed(result))
+
+
+def _build_midi(midi_notes, duration_seconds, program=0):
+    """Build a minimal MIDI file playing the given notes simultaneously."""
+    ticks_per_beat = 480
+    tempo = 500000  # 120 BPM => 1 beat = 0.5s
+    duration_ticks = int(ticks_per_beat * 2 * duration_seconds)
+
+    track_data = b""
+    # Tempo meta event
+    track_data += b"\x00\xff\x51\x03" + tempo.to_bytes(3, "big")
+    # Program change
+    track_data += b"\x00\xc0" + bytes([program & 0x7f])
+
+    # Note on for all notes (delta=0 for all)
+    for note in midi_notes:
+        track_data += b"\x00\x90" + bytes([note & 0x7f, 100])
+
+    # Note off after duration (first note gets the delta, rest get 0)
+    for i, note in enumerate(midi_notes):
+        delta = _write_var_len(duration_ticks) if i == 0 else b"\x00"
+        track_data += delta + b"\x80" + bytes([note & 0x7f, 0])
+
+    # End of track
+    track_data += b"\x00\xff\x2f\x00"
+
+    header = b"MThd" + struct.pack(">I", 6) + struct.pack(">HHH", 0, 1, ticks_per_beat)
+    track = b"MTrk" + struct.pack(">I", len(track_data)) + track_data
+
+    fd, path = tempfile.mkstemp(suffix=".mid")
+    with os.fdopen(fd, "wb") as f:
+        f.write(header + track)
+    return path
+
+
+def _render_midi_to_wav(midi_path, soundfont_path):
+    """Use FluidSynth to render a MIDI file to WAV."""
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+
+    result = subprocess.run(
+        [
+            "fluidsynth", "-ni",
+            "-F", wav_path,
+            "-r", str(SAMPLE_RATE),
+            "-g", "1.0",
+            soundfont_path, midi_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    os.unlink(midi_path)
+
+    if result.returncode != 0 or os.path.getsize(wav_path) == 0:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+        return None
+
+    return wav_path
+
+
+# ── Core helpers ──────────────────────────────────────────────────────
 
 def midi_to_freq(midi_note):
     """Convert MIDI note number to frequency in Hz."""
@@ -70,6 +259,8 @@ def _duration_for_midi(midi_note):
         return 2.5
     return BASE_DURATION
 
+
+# ── Additive synthesis (fallback) ─────────────────────────────────────
 
 def _build_wav(raw_bytes):
     """Wrap raw 16-bit PCM mono samples in a WAV container and write to temp file."""
@@ -120,8 +311,8 @@ def _synthesize_note(freq, duration, amplitude):
     return samples
 
 
-def generate_wav(midi_note):
-    """Generate a WAV file for a single MIDI note."""
+def _generate_wav_fallback(midi_note):
+    """Generate a WAV file using additive synthesis (no FluidSynth)."""
     freq = midi_to_freq(midi_note)
     duration = _duration_for_midi(midi_note)
     samples = _synthesize_note(freq, duration, AMPLITUDE)
@@ -133,32 +324,70 @@ def generate_wav(midi_note):
     return _build_wav(raw)
 
 
-def generate_chord_wav(midi_notes):
-    """Generate a WAV file for a chord (multiple MIDI notes played together)."""
+def _generate_chord_wav_fallback(midi_notes):
+    """Generate a chord WAV using additive synthesis (no FluidSynth)."""
     if not midi_notes:
-        return generate_wav(60)
+        return _generate_wav_fallback(60)
 
-    # Use the duration of the lowest note
     duration = max(_duration_for_midi(n) for n in midi_notes)
     num_samples = int(SAMPLE_RATE * duration)
 
-    # Synthesize each note
     note_samples_list = []
     for midi_note in midi_notes:
         freq = midi_to_freq(midi_note)
-        note_dur = duration
-        ns = _synthesize_note(freq, note_dur, AMPLITUDE / len(midi_notes))
-        # Pad if shorter
+        ns = _synthesize_note(freq, duration, AMPLITUDE / len(midi_notes))
         if len(ns) < num_samples:
             ns.extend([0.0] * (num_samples - len(ns)))
         note_samples_list.append(ns)
 
-    # Mix
     raw = b"".join(
         struct.pack("<h", int(max(-1.0, min(1.0, sum(ns[i] for ns in note_samples_list))) * 32767))
         for i in range(num_samples)
     )
     return _build_wav(raw)
+
+
+# ── Public API ────────────────────────────────────────────────────────
+
+def generate_wav(midi_note, instrument=None):
+    """Generate a WAV file for a single MIDI note.
+
+    Args:
+        midi_note: MIDI note number (21-108).
+        instrument: Index into INSTRUMENTS list, or None for fallback synth.
+    """
+    if instrument is not None and fluidsynth_available():
+        program = INSTRUMENTS[instrument][0]
+        sf2 = get_soundfont()
+        duration = _duration_for_midi(midi_note)
+        midi_path = _build_midi([midi_note], duration, program)
+        wav_path = _render_midi_to_wav(midi_path, sf2)
+        if wav_path:
+            return wav_path
+    # Fallback to additive synthesis
+    return _generate_wav_fallback(midi_note)
+
+
+def generate_chord_wav(midi_notes, instrument=None):
+    """Generate a WAV file for a chord.
+
+    Args:
+        midi_notes: List of MIDI note numbers.
+        instrument: Index into INSTRUMENTS list, or None for fallback synth.
+    """
+    if not midi_notes:
+        return generate_wav(60, instrument)
+
+    if instrument is not None and fluidsynth_available():
+        program = INSTRUMENTS[instrument][0]
+        sf2 = get_soundfont()
+        duration = max(_duration_for_midi(n) for n in midi_notes)
+        midi_path = _build_midi(midi_notes, duration, program)
+        wav_path = _render_midi_to_wav(midi_path, sf2)
+        if wav_path:
+            return wav_path
+    # Fallback
+    return _generate_chord_wav_fallback(midi_notes)
 
 
 def play_wav_async(path):
