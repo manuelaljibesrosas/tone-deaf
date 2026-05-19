@@ -1,189 +1,362 @@
 #!/usr/bin/env python3
-"""Ear training program: identifies random notes by ear."""
+"""Ear training program: note identification and chord recognition."""
 
 import curses
-import math
-import os
 import random
-import struct
-import subprocess
-import tempfile
-import threading
 
-# Piano range: A0 (MIDI 21) to C8 (MIDI 108)
-MIDI_LOW = 21
-MIDI_HIGH = 108
+from synth import (
+    ACCIDENTAL_CYCLE,
+    MIDI_HIGH,
+    MIDI_LOW,
+    NAME_TO_PITCH_CLASS,
+    NOTE_NAMES,
+    generate_chord_wav,
+    generate_wav,
+    midi_to_name,
+    midi_to_pitch_class,
+    play_wav_async,
+)
 
-SAMPLE_RATE = 44100
-DURATION = 2.0
-AMPLITUDE = 0.6
+# ── Chord definitions ──────────────────────────────────────────────────
 
-# All 12 pitch classes mapped to their semitone offset from C
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-# Enharmonic equivalence: map every note name to its pitch class (0-11)
-NAME_TO_PITCH_CLASS = {
-    "C": 0, "B#": 0,
-    "C#": 1, "Db": 1,
-    "D": 2,
-    "D#": 3, "Eb": 3,
-    "E": 4, "Fb": 4,
-    "F": 5, "E#": 5,
-    "F#": 6, "Gb": 6,
-    "G": 7,
-    "G#": 8, "Ab": 8,
-    "A": 9,
-    "A#": 10, "Bb": 10,
-    "B": 11, "Cb": 11,
+# Intervals in semitones from root for each chord quality
+CHORD_INTERVALS = {
+    "Maj":  [0, 4, 7],
+    "Min":  [0, 3, 7],
+    "Aug":  [0, 4, 8],
+    "Dim":  [0, 3, 6],
+    "Dom7": [0, 4, 7, 10],
+    "Maj7": [0, 4, 7, 11],
+    "Min7": [0, 3, 7, 10],
 }
 
-ACCIDENTAL_CYCLE = ["", "#", "b"]  # natural, sharp, flat
+TRIAD_TYPES = ["Maj", "Min", "Aug", "Dim"]
+SEVENTH_TYPES = ["Dom7", "Maj7", "Min7"]
+ALL_CHORD_TYPES = TRIAD_TYPES + SEVENTH_TYPES
+
+INVERSION_NAMES = ["root", "1st", "2nd", "3rd"]
 
 
-def midi_to_freq(midi_note):
-    """Convert MIDI note number to frequency in Hz."""
-    return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+def build_chord_midi(root_midi, chord_type, inversion):
+    """Build list of MIDI notes for a chord with given root, type, and inversion."""
+    intervals = list(CHORD_INTERVALS[chord_type])
+    num_notes = len(intervals)
+
+    if inversion > 0 and inversion < num_notes:
+        # Rotate intervals: move bottom notes up an octave
+        for _ in range(inversion):
+            intervals.append(intervals.pop(0) + 12)
+
+    return [root_midi + iv for iv in intervals]
 
 
-def midi_to_name(midi_note):
-    """Convert MIDI note to human-readable name like C#4."""
-    pitch_class = (midi_note - 12) % 12
-    octave = (midi_note - 12) // 12
-    return f"{NOTE_NAMES[pitch_class]}{octave}"
+def max_inversion_for(chord_type):
+    """Return the maximum inversion index for a chord type."""
+    return len(CHORD_INTERVALS[chord_type]) - 1
 
 
-def midi_to_pitch_class(midi_note):
-    """Get pitch class (0-11) from MIDI note."""
-    return (midi_note - 12) % 12
-
-
-def generate_wav(midi_note):
-    """Generate a WAV file for a given MIDI note with piano-like timbre."""
-    freq = midi_to_freq(midi_note)
-    num_samples = int(SAMPLE_RATE * DURATION)
-
-    samples = []
-    for i in range(num_samples):
-        t = i / SAMPLE_RATE
-
-        # Envelope: fast attack, gradual decay
-        attack = 0.01
-        decay_rate = 1.5
-        if t < attack:
-            envelope = t / attack
-        else:
-            envelope = math.exp(-decay_rate * (t - attack))
-
-        # Richer timbre: fundamental + harmonics with decreasing amplitude
-        value = 0.0
-        harmonics = [(1, 1.0), (2, 0.5), (3, 0.25), (4, 0.12), (5, 0.06)]
-        for harmonic, amp in harmonics:
-            # Higher harmonics decay faster
-            h_envelope = envelope * math.exp(-0.5 * harmonic * t)
-            value += amp * h_envelope * math.sin(2 * math.pi * freq * harmonic * t)
-
-        # Normalize by sum of harmonic amplitudes
-        value = value / sum(a for _, a in harmonics)
-        value *= AMPLITUDE
-
-        clamped = max(-1.0, min(1.0, value))
-        samples.append(struct.pack("<h", int(clamped * 32767)))
-
-    raw = b"".join(samples)
-    wav_header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        36 + len(raw),
-        b"WAVE",
-        b"fmt ",
-        16,
-        1,  # PCM
-        1,  # mono
-        SAMPLE_RATE,
-        SAMPLE_RATE * 2,
-        2,  # block align
-        16,  # bits per sample
-        b"data",
-        len(raw),
-    )
-
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    with os.fdopen(fd, "wb") as f:
-        f.write(wav_header + raw)
-    return path
-
-
-def play_wav_async(path):
-    """Play a WAV file asynchronously, return the process."""
-    proc = subprocess.Popen(
-        ["paplay", path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    # Clean up temp file after playback finishes
-    def cleanup():
-        proc.wait()
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    threading.Thread(target=cleanup, daemon=True).start()
-    return proc
-
+# ── UI drawing helpers ─────────────────────────────────────────────────
 
 def draw_box(stdscr, y, x, h, w):
-    """Draw a box with Unicode box-drawing characters."""
-    # Corners
-    stdscr.addstr(y, x, "┌")
-    stdscr.addstr(y, x + w - 1, "┐")
-    stdscr.addstr(y + h - 1, x, "└")
-    stdscr.addstr(y + h - 1, x + w - 1, "┘")
-    # Horizontal lines
-    for col in range(x + 1, x + w - 1):
-        stdscr.addstr(y, col, "─")
-        stdscr.addstr(y + h - 1, col, "─")
-    # Vertical lines
-    for row in range(y + 1, y + h - 1):
-        stdscr.addstr(row, x, "│")
-        stdscr.addstr(row, x + w - 1, "│")
+    try:
+        stdscr.addstr(y, x, "┌")
+        stdscr.addstr(y, x + w - 1, "┐")
+        stdscr.addstr(y + h - 1, x, "└")
+        # Bottom-right corner: use insstr to avoid curses wrapping error
+        try:
+            stdscr.addstr(y + h - 1, x + w - 1, "┘")
+        except curses.error:
+            pass
+        for col in range(x + 1, x + w - 1):
+            stdscr.addstr(y, col, "─")
+            try:
+                stdscr.addstr(y + h - 1, col, "─")
+            except curses.error:
+                pass
+        for row in range(y + 1, y + h - 1):
+            stdscr.addstr(row, x, "│")
+            try:
+                stdscr.addstr(row, x + w - 1, "│")
+            except curses.error:
+                pass
+    except curses.error:
+        pass
 
 
 def draw_separator(stdscr, y, x, w):
-    """Draw a horizontal separator with T-junctions."""
-    stdscr.addstr(y, x, "├")
-    stdscr.addstr(y, x + w - 1, "┤")
-    for col in range(x + 1, x + w - 1):
-        stdscr.addstr(y, col, "─")
+    try:
+        stdscr.addstr(y, x, "├")
+        stdscr.addstr(y, x + w - 1, "┤")
+        for col in range(x + 1, x + w - 1):
+            stdscr.addstr(y, col, "─")
+    except curses.error:
+        pass
 
 
-def main(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(False)
-    stdscr.keypad(True)
+def safe_addstr(stdscr, y, x, text, attr=curses.A_NORMAL):
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
 
+
+def is_up(key):
+    return key == curses.KEY_UP or key == ord("k")
+
+def is_down(key):
+    return key == curses.KEY_DOWN or key == ord("j")
+
+def is_left(key):
+    return key == curses.KEY_LEFT or key == ord("h")
+
+def is_right(key):
+    return key == curses.KEY_RIGHT or key == ord("l")
+
+
+# ── Mode selection screen ──────────────────────────────────────────────
+
+def mode_select_screen(stdscr):
+    """Show mode selection. Returns 'note', 'chord', or None (quit)."""
+    BOX_W = 47
+    BOX_H = 10
+    selected = 0
+    modes = [("Note Training", "note"), ("Chord Training", "chord")]
+
+    while True:
+        stdscr.erase()
+        y0, x0 = 1, 2
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "EAR TRAINER", curses.A_BOLD)
+
+        for i, (label, _) in enumerate(modes):
+            marker = " > " if i == selected else "   "
+            attr = curses.A_BOLD if i == selected else curses.A_NORMAL
+            safe_addstr(stdscr, y0 + 4 + i, x0 + 2, f"{marker}{label}", attr)
+
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[j/\u2193 k/\u2191] select  [Enter] start")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] quit")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return None
+        elif is_up(key):
+            selected = (selected - 1) % len(modes)
+        elif is_down(key):
+            selected = (selected + 1) % len(modes)
+        elif key in (ord("\n"), ord("\r")):
+            return modes[selected][1]
+
+
+# ── Note selection view ────────────────────────────────────────────────
+
+# Display labels for the 12 pitch classes
+PITCH_CLASS_LABELS = [
+    "C", "C#/Db", "D", "D#/Eb", "E", "F",
+    "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B",
+]
+
+# Map letter keys to list of pitch classes they can toggle
+LETTER_TO_PC = {
+    "C": [0, 1],   # C, C#/Db
+    "D": [2, 3],   # D, D#/Eb
+    "E": [4],       # E
+    "F": [5, 6],   # F, F#/Gb
+    "G": [7, 8],   # G, G#/Ab
+    "A": [9, 10],  # A, A#/Bb
+    "B": [11],      # B
+}
+
+
+def note_selection_screen(stdscr, enabled_pcs):
+    """Show note selection. enabled_pcs is a set of pitch classes (0-11).
+    Returns updated set, or original set if cancelled."""
+    BOX_W = 50
+    BOX_H = 13
+    selected = set(enabled_pcs)  # work on a copy
+    cursor = 0  # index into PITCH_CLASS_LABELS (0-11)
+
+    while True:
+        stdscr.erase()
+        y0, x0 = 1, 2
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "NOTE SELECTION", curses.A_BOLD)
+
+        # Draw notes in 3 rows of 4
+        for i, label in enumerate(PITCH_CLASS_LABELS):
+            row_offset = i // 4
+            col_offset = i % 4
+            r = y0 + 4 + row_offset
+            c = x0 + 3 + col_offset * 11
+
+            check = "x" if i in selected else " "
+            marker = ">" if i == cursor else " "
+            attr = curses.A_BOLD if i == cursor else curses.A_NORMAL
+            safe_addstr(stdscr, r, c, f"{marker}[{check}] {label:<5}", attr)
+
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[h/\u2190 j/\u2193 k/\u2191 l/\u2192] move  [Space] toggle")
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[A] all on  [X] all off")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Enter] confirm  [Esc] cancel")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return enabled_pcs
+        elif is_right(key):
+            cursor = (cursor + 1) % 12
+        elif is_left(key):
+            cursor = (cursor - 1) % 12
+        elif is_down(key):
+            cursor = min(cursor + 4, 11)
+        elif is_up(key):
+            cursor = max(cursor - 4, 0)
+        elif key == ord(" "):
+            if cursor in selected:
+                if len(selected) > 1:
+                    selected.discard(cursor)
+            else:
+                selected.add(cursor)
+        elif key in (ord("a"), ord("A")):
+            selected = set(range(12))
+        elif key in (ord("x"), ord("X")):
+            # Keep at least one
+            selected = {cursor}
+        elif key in (ord("\n"), ord("\r")):
+            if len(selected) >= 1:
+                return selected
+
+
+# ── Chord selection view ───────────────────────────────────────────────
+
+def chord_selection_screen(stdscr, enabled_chords, enabled_inversions):
+    """Configure which chord types and inversions to test.
+    Returns (enabled_chords, enabled_inversions) sets, or originals if cancelled."""
+    BOX_W = 50
+    BOX_H = 16
+
+    chords = set(enabled_chords)
+    inversions = set(enabled_inversions)
+
+    # Build flat list of toggleable items for cursor navigation
+    # Items: (category, index, label)
+    items = []
+    for ct in TRIAD_TYPES:
+        items.append(("chord", ct, ct))
+    for ct in SEVENTH_TYPES:
+        items.append(("chord", ct, ct))
+    for i, name in enumerate(INVERSION_NAMES):
+        items.append(("inv", i, name))
+
+    cursor = 0
+
+    while True:
+        stdscr.erase()
+        y0, x0 = 1, 2
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "CHORD SELECTION", curses.A_BOLD)
+
+        # Triads row
+        safe_addstr(stdscr, y0 + 3, x0 + 3, "Triads:", curses.A_NORMAL)
+        for i, ct in enumerate(TRIAD_TYPES):
+            idx = i  # index in items
+            check = "x" if ct in chords else " "
+            marker = ">" if cursor == idx else " "
+            attr = curses.A_BOLD if cursor == idx else curses.A_NORMAL
+            safe_addstr(stdscr, y0 + 4, x0 + 3 + i * 11, f"{marker}[{check}] {ct:<4}", attr)
+
+        # Sevenths row
+        safe_addstr(stdscr, y0 + 6, x0 + 3, "Sevenths:", curses.A_NORMAL)
+        for i, ct in enumerate(SEVENTH_TYPES):
+            idx = len(TRIAD_TYPES) + i
+            check = "x" if ct in chords else " "
+            marker = ">" if cursor == idx else " "
+            attr = curses.A_BOLD if cursor == idx else curses.A_NORMAL
+            safe_addstr(stdscr, y0 + 7, x0 + 3 + i * 11, f"{marker}[{check}] {ct:<4}", attr)
+
+        # Inversions row
+        safe_addstr(stdscr, y0 + 9, x0 + 3, "Inversions:", curses.A_NORMAL)
+        for i, name in enumerate(INVERSION_NAMES):
+            idx = len(ALL_CHORD_TYPES) + i
+            check = "x" if i in inversions else " "
+            marker = ">" if cursor == idx else " "
+            attr = curses.A_BOLD if cursor == idx else curses.A_NORMAL
+            safe_addstr(stdscr, y0 + 10, x0 + 3 + i * 11, f"{marker}[{check}] {name:<4}", attr)
+
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[h/\u2190 j/\u2193 k/\u2191 l/\u2192] move  [Space] toggle")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Enter] confirm  [Esc] cancel")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return enabled_chords, enabled_inversions
+        elif is_right(key):
+            cursor = (cursor + 1) % len(items)
+        elif is_left(key):
+            cursor = (cursor - 1) % len(items)
+        elif is_down(key) or is_up(key):
+            # Move between sections: triads(0-3), sevenths(4-6), inversions(7-10)
+            triad_end = len(TRIAD_TYPES)
+            seventh_end = triad_end + len(SEVENTH_TYPES)
+            if is_down(key):
+                if cursor < triad_end:
+                    cursor = min(cursor + triad_end, seventh_end - 1)
+                elif cursor < seventh_end:
+                    col = cursor - triad_end
+                    cursor = min(seventh_end + col, len(items) - 1)
+            else:  # UP
+                if cursor >= seventh_end:
+                    col = cursor - seventh_end
+                    cursor = triad_end + min(col, len(SEVENTH_TYPES) - 1)
+                elif cursor >= triad_end:
+                    col = cursor - triad_end
+                    cursor = min(col, triad_end - 1)
+        elif key == ord(" "):
+            cat, val, _ = items[cursor]
+            if cat == "chord":
+                if val in chords:
+                    if len(chords) > 1:
+                        chords.discard(val)
+                else:
+                    chords.add(val)
+            else:  # inv
+                if val in inversions:
+                    if len(inversions) > 1:
+                        inversions.discard(val)
+                else:
+                    inversions.add(val)
+        elif key in (ord("\n"), ord("\r")):
+            return chords, inversions
+
+
+# ── Note training mode ─────────────────────────────────────────────────
+
+def note_training(stdscr):
+    """Single-note ear training loop."""
+    enabled_pcs = set(range(12))  # all notes enabled
     correct = 0
     total = 0
     current_note = None
-    current_wav = None
     answer_letter = ""
-    accidental_idx = 0  # index into ACCIDENTAL_CYCLE
+    accidental_idx = 0
     feedback = ""
     feedback_attr = curses.A_NORMAL
 
-    BOX_W = 47
-    BOX_H = 10
+    BOX_W = 50
+    BOX_H = 11
 
     def pick_note():
-        nonlocal current_note, current_wav
-        current_note = random.randint(MIDI_LOW, MIDI_HIGH)
-        current_wav = generate_wav(current_note)
+        nonlocal current_note
+        while True:
+            n = random.randint(MIDI_LOW, MIDI_HIGH)
+            if midi_to_pitch_class(n) in enabled_pcs:
+                current_note = n
+                return
 
     def play_current():
-        if current_wav and os.path.exists(current_wav):
-            # Re-generate since cleanup might have deleted it
-            path = generate_wav(current_note)
-        else:
-            path = current_wav or generate_wav(current_note)
+        path = generate_wav(current_note)
         play_wav_async(path)
 
     def get_answer_str():
@@ -195,7 +368,7 @@ def main(stdscr):
         nonlocal correct, total, feedback, feedback_attr
         answer = answer_letter + ACCIDENTAL_CYCLE[accidental_idx]
         if answer not in NAME_TO_PITCH_CLASS:
-            feedback = f"  Invalid note: {answer}"
+            feedback = "  Invalid note: " + answer
             feedback_attr = curses.A_BOLD
             return False
         answer_pc = NAME_TO_PITCH_CLASS[answer]
@@ -205,17 +378,15 @@ def main(stdscr):
         if answer_pc == actual_pc:
             correct += 1
             feedback = f"  \u2713 Correct! It was {note_name}"
-            feedback_attr = curses.A_BOLD
         else:
             feedback = f"  \u2717 Wrong! It was {note_name} (you said: {answer})"
-            feedback_attr = curses.A_BOLD
+        feedback_attr = curses.A_BOLD
         return True
 
     def render():
         stdscr.erase()
         y0, x0 = 1, 2
 
-        # Score string
         if total == 0:
             score_str = "Score: 0/0 -%"
         else:
@@ -225,33 +396,23 @@ def main(stdscr):
         draw_box(stdscr, y0, x0, BOX_H, BOX_W)
         draw_separator(stdscr, y0 + 2, x0, BOX_W)
 
-        # Header
-        header = "  EAR TRAINER"
-        stdscr.addstr(y0 + 1, x0 + 1, header, curses.A_BOLD)
-        stdscr.addstr(y0 + 1, x0 + BOX_W - 2 - len(score_str), score_str)
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "NOTE TRAINER", curses.A_BOLD)
+        safe_addstr(stdscr, y0 + 1, x0 + BOX_W - 2 - len(score_str), score_str)
 
-        # Feedback line
         row = y0 + 3
         if feedback:
-            stdscr.addstr(row, x0 + 1, feedback[:BOX_W - 3], feedback_attr)
+            safe_addstr(stdscr, row, x0 + 2, feedback[:BOX_W - 4], feedback_attr)
             row += 1
 
-        # Listen prompt
-        stdscr.addstr(row, x0 + 1, "  \u266a Listen...", curses.A_NORMAL)
-        row += 1
+        safe_addstr(stdscr, row, x0 + 2, "\u266a Listen...", curses.A_NORMAL)
+        row += 2
+        safe_addstr(stdscr, row, x0 + 2, f"Your answer:  {get_answer_str()}")
 
-        # Answer
-        row += 1
-        answer_display = get_answer_str()
-        stdscr.addstr(row, x0 + 1, f"  Your answer:  {answer_display}", curses.A_NORMAL)
-
-        # Controls
-        stdscr.addstr(y0 + BOX_H - 3, x0 + 1, "  [A-G] note  [Tab] #/b  [Enter] submit")
-        stdscr.addstr(y0 + BOX_H - 2, x0 + 1, "  [R] replay  [Esc] quit")
-
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[A-G] note  [Tab] #/b  [Enter] submit")
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[R] replay  [N] note selection")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
         stdscr.refresh()
 
-    # Start first round
     pick_note()
     play_current()
     render()
@@ -259,29 +420,217 @@ def main(stdscr):
     while True:
         key = stdscr.getch()
 
-        if key == 27:  # Esc
-            break
-        elif key == ord("\t"):  # Tab
+        if key == 27:
+            return
+        elif key in (ord("n"), ord("N")):
+            enabled_pcs = note_selection_screen(stdscr, enabled_pcs)
+            # Pick a new note from the updated selection
+            answer_letter = ""
+            accidental_idx = 0
+            feedback = ""
+            pick_note()
+            play_current()
+        elif key == ord("\t"):
             if answer_letter:
                 accidental_idx = (accidental_idx + 1) % 3
-        elif key in (ord("\n"), ord("\r")):  # Enter
+        elif key in (ord("\n"), ord("\r")):
             if answer_letter:
                 if check_answer():
                     render()
                     stdscr.refresh()
-                    # Brief pause to show feedback, then next note
                     curses.napms(1200)
                     answer_letter = ""
                     accidental_idx = 0
                     pick_note()
                     play_current()
-        elif key == ord("r") or key == ord("R"):
+        elif key in (ord("r"), ord("R")):
             play_current()
         elif ord("a") <= key <= ord("g") or ord("A") <= key <= ord("G"):
             answer_letter = chr(key).upper()
-            accidental_idx = 0  # reset accidental when picking new letter
+            accidental_idx = 0
 
         render()
+
+
+# ── Chord training mode ────────────────────────────────────────────────
+
+def chord_training(stdscr):
+    """Chord recognition ear training loop."""
+    enabled_chords = set(ALL_CHORD_TYPES)
+    enabled_inversions = {0, 1, 2}  # root, 1st, 2nd (3rd only for 7ths)
+
+    correct = 0
+    total = 0
+    current_root = None
+    current_type = None
+    current_inv = None
+    feedback = ""
+    feedback_attr = curses.A_NORMAL
+
+    # Answer state
+    type_options = list(ALL_CHORD_TYPES)
+    inv_options = list(INVERSION_NAMES)
+    answer_type_idx = 0
+    answer_inv_idx = 0
+    focus = 0  # 0 = quality, 1 = inversion
+
+    BOX_W = 50
+    BOX_H = 12
+
+    def pick_chord():
+        nonlocal current_root, current_type, current_inv
+        # Pick a valid chord type
+        valid_types = [ct for ct in ALL_CHORD_TYPES if ct in enabled_chords]
+        if not valid_types:
+            valid_types = ["Maj"]
+        current_type = random.choice(valid_types)
+
+        # Pick a valid inversion
+        max_inv = max_inversion_for(current_type)
+        valid_invs = [i for i in enabled_inversions if i <= max_inv]
+        if not valid_invs:
+            valid_invs = [0]
+        current_inv = random.choice(valid_invs)
+
+        # Pick a root that keeps all chord notes in piano range
+        intervals = list(CHORD_INTERVALS[current_type])
+        if current_inv > 0:
+            for _ in range(current_inv):
+                intervals.append(intervals.pop(0) + 12)
+        max_interval = max(intervals)
+
+        lo = 36  # C2 — chords below this are inaudible on most headphones
+        hi = MIDI_HIGH - max_interval
+        if hi < lo:
+            hi = lo
+        current_root = random.randint(lo, hi)
+
+    def play_current():
+        notes = build_chord_midi(current_root, current_type, current_inv)
+        path = generate_chord_wav(notes)
+        play_wav_async(path)
+
+    def check_answer():
+        nonlocal correct, total, feedback, feedback_attr
+        answer_type = type_options[answer_type_idx]
+        answer_inv = answer_inv_idx
+        total += 1
+        root_name = midi_to_name(current_root)
+        actual_str = f"{root_name} {current_type} ({INVERSION_NAMES[current_inv]})"
+
+        type_correct = (answer_type == current_type)
+        inv_correct = (answer_inv == current_inv)
+
+        if type_correct and inv_correct:
+            correct += 1
+            feedback = f"  \u2713 Correct! {actual_str}"
+        else:
+            ans_str = f"{answer_type}, {INVERSION_NAMES[answer_inv]}"
+            feedback = f"  \u2717 Wrong! {actual_str} (you: {ans_str})"
+        feedback_attr = curses.A_BOLD
+        return True
+
+    def render():
+        stdscr.erase()
+        y0, x0 = 1, 2
+
+        if total == 0:
+            score_str = "Score: 0/0 -%"
+        else:
+            pct = int(100 * correct / total)
+            score_str = f"Score: {correct}/{total} {pct}%"
+
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "CHORD TRAINER", curses.A_BOLD)
+        safe_addstr(stdscr, y0 + 1, x0 + BOX_W - 2 - len(score_str), score_str)
+
+        row = y0 + 3
+        if feedback:
+            safe_addstr(stdscr, row, x0 + 2, feedback[:BOX_W - 4], feedback_attr)
+            row += 1
+
+        safe_addstr(stdscr, row, x0 + 2, "\u266a Listen...")
+        row += 2
+
+        # Quality selector
+        q_label = f"[ {type_options[answer_type_idx]:<4} ]"
+        q_attr = curses.A_BOLD if focus == 0 else curses.A_NORMAL
+        safe_addstr(stdscr, row, x0 + 2, "Quality: ", curses.A_NORMAL)
+        safe_addstr(stdscr, row, x0 + 11, q_label, q_attr)
+
+        # Inversion selector
+        i_label = f"[ {inv_options[answer_inv_idx]:<4} ]"
+        i_attr = curses.A_BOLD if focus == 1 else curses.A_NORMAL
+        safe_addstr(stdscr, row, x0 + 24, "Inversion: ", curses.A_NORMAL)
+        safe_addstr(stdscr, row, x0 + 35, i_label, i_attr)
+
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[Tab] field  [j/\u2193 k/\u2191] cycle  [Enter] submit")
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[R] replay  [N] chord selection")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
+        stdscr.refresh()
+
+    pick_chord()
+    play_current()
+    render()
+
+    while True:
+        key = stdscr.getch()
+
+        if key == 27:
+            return
+        elif key in (ord("n"), ord("N")):
+            enabled_chords, enabled_inversions = chord_selection_screen(
+                stdscr, enabled_chords, enabled_inversions
+            )
+            feedback = ""
+            answer_type_idx = 0
+            answer_inv_idx = 0
+            pick_chord()
+            play_current()
+        elif key == ord("\t"):
+            focus = (focus + 1) % 2
+        elif is_up(key):
+            if focus == 0:
+                answer_type_idx = (answer_type_idx - 1) % len(type_options)
+            else:
+                answer_inv_idx = (answer_inv_idx - 1) % len(inv_options)
+        elif is_down(key):
+            if focus == 0:
+                answer_type_idx = (answer_type_idx + 1) % len(type_options)
+            else:
+                answer_inv_idx = (answer_inv_idx + 1) % len(inv_options)
+        elif key in (ord("\n"), ord("\r")):
+            check_answer()
+            render()
+            stdscr.refresh()
+            curses.napms(1200)
+            answer_type_idx = 0
+            answer_inv_idx = 0
+            pick_chord()
+            play_current()
+        elif key in (ord("r"), ord("R")):
+            play_current()
+
+        render()
+
+
+# ── Main ───────────────────────────────────────────────────────────────
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    stdscr.keypad(True)
+
+    while True:
+        mode = mode_select_screen(stdscr)
+        if mode is None:
+            break
+        elif mode == "note":
+            note_training(stdscr)
+        elif mode == "chord":
+            chord_training(stdscr)
 
 
 if __name__ == "__main__":
@@ -290,5 +639,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
 
-    # Print final score after curses exits
     print("\nThanks for practicing!")
