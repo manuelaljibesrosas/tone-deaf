@@ -4,6 +4,14 @@
 import curses
 import random
 
+from config import (
+    load_chord_training_config,
+    load_key_training_config,
+    load_note_training_config,
+    save_chord_training_config,
+    save_key_training_config,
+    save_note_training_config,
+)
 from synth import (
     ACCIDENTAL_CYCLE,
     INSTRUMENTS,
@@ -14,6 +22,7 @@ from synth import (
     NOTE_NAMES,
     fluidsynth_available,
     generate_chord_wav,
+    generate_progression_wav,
     generate_wav,
     instrument_range,
     midi_to_name,
@@ -120,11 +129,11 @@ def is_right(key):
 # ── Mode selection screen ──────────────────────────────────────────────
 
 def mode_select_screen(stdscr):
-    """Show mode selection. Returns 'note', 'chord', or None (quit)."""
+    """Show mode selection. Returns 'note', 'chord', 'key', or None (quit)."""
     BOX_W = 47
-    BOX_H = 10
+    BOX_H = 11
     selected = 0
-    modes = [("Note Training", "note"), ("Chord Training", "chord")]
+    modes = [("Note Training", "note"), ("Chord Training", "chord"), ("Key Training", "key")]
 
     while True:
         stdscr.erase()
@@ -395,8 +404,9 @@ def chord_selection_screen(stdscr, enabled_chords, enabled_inversions):
 
 def note_training(stdscr):
     """Single-note ear training loop."""
-    enabled_pcs = set(range(12))  # all notes enabled
-    instrument = None  # None = built-in synth
+    saved_pcs, saved_instr = load_note_training_config()
+    enabled_pcs = saved_pcs
+    instrument = saved_instr
     correct = 0
     total = 0
     current_note = None
@@ -489,9 +499,11 @@ def note_training(stdscr):
         key = stdscr.getch()
 
         if key == 27:
+            save_note_training_config(enabled_pcs, instrument)
             return
         elif key in (ord("n"), ord("N")):
             enabled_pcs = note_selection_screen(stdscr, enabled_pcs)
+            save_note_training_config(enabled_pcs, instrument)
             answer_letter = ""
             accidental_idx = 0
             feedback = ""
@@ -499,6 +511,7 @@ def note_training(stdscr):
             play_current()
         elif key in (ord("i"), ord("I")):
             instrument = instrument_selection_screen(stdscr, instrument)
+            save_note_training_config(enabled_pcs, instrument)
             feedback = ""
             pick_note()
             play_current()
@@ -528,9 +541,10 @@ def note_training(stdscr):
 
 def chord_training(stdscr):
     """Chord recognition ear training loop."""
-    enabled_chords = set(ALL_CHORD_TYPES)
-    enabled_inversions = {0, 1, 2}  # root, 1st, 2nd (3rd only for 7ths)
-    instrument = None  # None = built-in synth
+    saved_chords, saved_inv, saved_instr = load_chord_training_config()
+    enabled_chords = saved_chords if saved_chords is not None else set(ALL_CHORD_TYPES)
+    enabled_inversions = saved_inv if saved_inv is not None else {0, 1, 2}
+    instrument = saved_instr
 
     correct = 0
     total = 0
@@ -659,11 +673,13 @@ def chord_training(stdscr):
         key = stdscr.getch()
 
         if key == 27:
+            save_chord_training_config(enabled_chords, enabled_inversions, instrument)
             return
         elif key in (ord("n"), ord("N")):
             enabled_chords, enabled_inversions = chord_selection_screen(
                 stdscr, enabled_chords, enabled_inversions
             )
+            save_chord_training_config(enabled_chords, enabled_inversions, instrument)
             feedback = ""
             answer_type_idx = 0
             answer_inv_idx = 0
@@ -671,6 +687,7 @@ def chord_training(stdscr):
             play_current()
         elif key in (ord("i"), ord("I")):
             instrument = instrument_selection_screen(stdscr, instrument)
+            save_chord_training_config(enabled_chords, enabled_inversions, instrument)
             feedback = ""
             pick_chord()
             play_current()
@@ -701,6 +718,301 @@ def chord_training(stdscr):
         render()
 
 
+# ── Progression definitions ────────────────────────────────────────────
+
+# Each progression is (name, [(semitone_offset_from_root, chord_quality), ...])
+MAJOR_PROGRESSIONS = [
+    ("I-IV-V-I",   [(0, "Maj"), (5, "Maj"), (7, "Maj"), (0, "Maj")]),
+    ("I-vi-IV-V",  [(0, "Maj"), (9, "Min"), (5, "Maj"), (7, "Maj")]),
+    ("I-V-vi-IV",  [(0, "Maj"), (7, "Maj"), (9, "Min"), (5, "Maj")]),
+    ("ii-V-I",     [(2, "Min"), (7, "Maj"), (0, "Maj")]),
+]
+
+MINOR_PROGRESSIONS = [
+    ("i-iv-V-i",      [(0, "Min"), (5, "Min"), (7, "Maj"), (0, "Min")]),
+    ("i-VI-III-VII",  [(0, "Min"), (8, "Maj"), (3, "Maj"), (10, "Maj")]),
+    ("i-iv-v-i",      [(0, "Min"), (5, "Min"), (7, "Min"), (0, "Min")]),
+]
+
+ALL_PROGRESSIONS = (
+    [("major", name, chords) for name, chords in MAJOR_PROGRESSIONS]
+    + [("minor", name, chords) for name, chords in MINOR_PROGRESSIONS]
+)
+
+
+def build_progression_midi_notes(root_midi, chord_defs):
+    """Build a list of chord MIDI note lists for a progression.
+
+    Each chord gets a bass note (root of chord in octave 2-3) and a triad in octave 4.
+    """
+    chords = []
+    for semitone, quality in chord_defs:
+        chord_root = root_midi + semitone
+        # Bass note in low register (octave 2-3 range, MIDI 36-59)
+        bass = chord_root
+        while bass < 36:
+            bass += 12
+        while bass >= 60:
+            bass -= 12
+
+        # Triad in octave 4 range (MIDI 60-72 area)
+        triad_root = chord_root
+        while triad_root < 60:
+            triad_root += 12
+        while triad_root >= 72:
+            triad_root -= 12
+
+        intervals = CHORD_INTERVALS[quality]
+        triad = [triad_root + iv for iv in intervals]
+        chords.append([bass] + triad)
+
+    return chords
+
+
+# ── Progression selection screen ───────────────────────────────────────
+
+def progression_selection_screen(stdscr, enabled_progressions):
+    """Select which progressions to include. enabled_progressions is a set of names.
+    Returns updated set, or original if cancelled."""
+    BOX_W = 50
+    BOX_H = 16
+
+    selected = set(enabled_progressions)
+    items = []  # (category, name)
+    for cat, name, _ in ALL_PROGRESSIONS:
+        items.append((cat, name))
+
+    cursor = 0
+
+    while True:
+        stdscr.erase()
+        y0, x0 = 1, 2
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "PROGRESSION SELECTION", curses.A_BOLD)
+
+        # Major
+        safe_addstr(stdscr, y0 + 3, x0 + 3, "Major:", curses.A_NORMAL)
+        row = y0 + 4
+        for i, (cat, name, _) in enumerate(ALL_PROGRESSIONS):
+            if cat != "major":
+                continue
+            check = "x" if name in selected else " "
+            marker = ">" if cursor == i else " "
+            attr = curses.A_BOLD if cursor == i else curses.A_NORMAL
+            safe_addstr(stdscr, row, x0 + 3, f"{marker}[{check}] {name}", attr)
+            row += 1
+
+        # Minor
+        row += 1
+        safe_addstr(stdscr, row, x0 + 3, "Minor:", curses.A_NORMAL)
+        row += 1
+        for i, (cat, name, _) in enumerate(ALL_PROGRESSIONS):
+            if cat != "minor":
+                continue
+            check = "x" if name in selected else " "
+            marker = ">" if cursor == i else " "
+            attr = curses.A_BOLD if cursor == i else curses.A_NORMAL
+            safe_addstr(stdscr, row, x0 + 3, f"{marker}[{check}] {name}", attr)
+            row += 1
+
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[j/\u2193 k/\u2191] move  [Space] toggle")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Enter] confirm  [Esc] cancel")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:
+            return enabled_progressions
+        elif is_down(key):
+            cursor = (cursor + 1) % len(items)
+        elif is_up(key):
+            cursor = (cursor - 1) % len(items)
+        elif key == ord(" "):
+            _, name = items[cursor]
+            if name in selected:
+                if len(selected) > 1:
+                    selected.discard(name)
+            else:
+                selected.add(name)
+        elif key in (ord("\n"), ord("\r")):
+            if len(selected) >= 1:
+                return selected
+
+
+# ── Key training mode ──────────────────────────────────────────────────
+
+def key_training(stdscr):
+    """Key identification ear training loop."""
+    saved_progs, saved_instr = load_key_training_config()
+    enabled_progressions = saved_progs if saved_progs is not None else {name for _, name, _ in ALL_PROGRESSIONS}
+    instrument = saved_instr
+
+    correct = 0
+    total = 0
+    current_root_pc = None  # pitch class 0-11
+    current_quality = None  # "major" or "minor"
+    current_prog_name = None
+    feedback = ""
+    feedback_attr = curses.A_NORMAL
+
+    answer_letter = ""
+    accidental_idx = 0
+    answer_quality = 0  # 0=Major, 1=Minor
+
+    BOX_W = 50
+    BOX_H = 14
+
+    def pick_progression():
+        nonlocal current_root_pc, current_quality, current_prog_name
+        # Filter to enabled progressions
+        valid = [(cat, name, chords) for cat, name, chords in ALL_PROGRESSIONS
+                 if name in enabled_progressions]
+        if not valid:
+            valid = ALL_PROGRESSIONS[:1]
+
+        cat, name, chord_defs = random.choice(valid)
+        current_quality = cat
+        current_prog_name = name
+        current_root_pc = random.randint(0, 11)
+
+    def play_current():
+        # Find the progression chord_defs
+        chord_defs = None
+        for cat, name, chords in ALL_PROGRESSIONS:
+            if name == current_prog_name:
+                chord_defs = chords
+                break
+
+        # Build MIDI root in a reasonable range (C3-C4 = MIDI 48-60)
+        root_midi = 48 + current_root_pc
+        chord_sequence = build_progression_midi_notes(root_midi, chord_defs)
+        path = generate_progression_wav(chord_sequence, instrument, chord_duration=1.0)
+        play_wav_async(path)
+
+    def get_answer_str():
+        if not answer_letter:
+            return "_"
+        return answer_letter + ACCIDENTAL_CYCLE[accidental_idx]
+
+    def get_quality_str():
+        return "Major" if answer_quality == 0 else "Minor"
+
+    def check_answer():
+        nonlocal correct, total, feedback, feedback_attr
+        answer = answer_letter + ACCIDENTAL_CYCLE[accidental_idx]
+        if answer not in NAME_TO_PITCH_CLASS:
+            feedback = "  Invalid note: " + answer
+            feedback_attr = curses.A_BOLD
+            return False
+
+        answer_pc = NAME_TO_PITCH_CLASS[answer]
+        answer_q = "major" if answer_quality == 0 else "minor"
+        total += 1
+
+        actual_name = NOTE_NAMES[current_root_pc]
+        actual_str = f"{actual_name} {current_quality} ({current_prog_name})"
+
+        if answer_pc == current_root_pc and answer_q == current_quality:
+            correct += 1
+            feedback = f"  \u2713 Correct! {actual_str}"
+        else:
+            ans_q = "major" if answer_quality == 0 else "minor"
+            feedback = f"  \u2717 Wrong! {actual_str} (you: {answer} {ans_q})"
+        feedback_attr = curses.A_BOLD
+        return True
+
+    def instrument_label():
+        if instrument is None:
+            return "Synth"
+        return INSTRUMENT_NAMES[instrument]
+
+    def render():
+        stdscr.erase()
+        y0, x0 = 1, 2
+
+        if total == 0:
+            score_str = "Score: 0/0 -%"
+        else:
+            pct = int(100 * correct / total)
+            score_str = f"Score: {correct}/{total} {pct}%"
+
+        draw_box(stdscr, y0, x0, BOX_H, BOX_W)
+        draw_separator(stdscr, y0 + 2, x0, BOX_W)
+
+        safe_addstr(stdscr, y0 + 1, x0 + 2, "KEY TRAINER", curses.A_BOLD)
+        safe_addstr(stdscr, y0 + 1, x0 + BOX_W - 2 - len(score_str), score_str)
+
+        row = y0 + 3
+        if feedback:
+            safe_addstr(stdscr, row, x0 + 2, feedback[:BOX_W - 4], feedback_attr)
+            row += 1
+
+        safe_addstr(stdscr, row, x0 + 2, f"\u266a Listen...  ({instrument_label()})")
+        row += 2
+
+        # Key answer
+        safe_addstr(stdscr, row, x0 + 2, f"Key: {get_answer_str():<4}")
+        # Quality answer
+        q_str = f"[ {get_quality_str():<5} ]"
+        safe_addstr(stdscr, row, x0 + 16, "Quality: ")
+        safe_addstr(stdscr, row, x0 + 25, q_str, curses.A_BOLD)
+
+        safe_addstr(stdscr, y0 + BOX_H - 5, x0 + 2, "[A-G] key  [Tab] #/b  [Space] Maj/Min")
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[R] replay  [N] progressions")
+        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[I] instrument  [Enter] submit")
+        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
+        stdscr.refresh()
+
+    pick_progression()
+    play_current()
+    render()
+
+    while True:
+        key = stdscr.getch()
+
+        if key == 27:
+            save_key_training_config(enabled_progressions, instrument)
+            return
+        elif key in (ord("n"), ord("N")):
+            enabled_progressions = progression_selection_screen(
+                stdscr, enabled_progressions
+            )
+            save_key_training_config(enabled_progressions, instrument)
+            feedback = ""
+            answer_letter = ""
+            accidental_idx = 0
+            pick_progression()
+            play_current()
+        elif key in (ord("i"), ord("I")):
+            instrument = instrument_selection_screen(stdscr, instrument)
+            save_key_training_config(enabled_progressions, instrument)
+            feedback = ""
+            pick_progression()
+            play_current()
+        elif key == ord("\t"):
+            if answer_letter:
+                accidental_idx = (accidental_idx + 1) % 3
+        elif key == ord(" "):
+            answer_quality = (answer_quality + 1) % 2
+        elif key in (ord("\n"), ord("\r")):
+            if answer_letter:
+                if check_answer():
+                    render()
+                    stdscr.refresh()
+                    curses.napms(1500)
+                    answer_letter = ""
+                    accidental_idx = 0
+                    pick_progression()
+                    play_current()
+        elif key in (ord("r"), ord("R")):
+            play_current()
+        elif ord("a") <= key <= ord("g") or ord("A") <= key <= ord("G"):
+            answer_letter = chr(key).upper()
+            accidental_idx = 0
+
+        render()
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main(stdscr):
@@ -716,6 +1028,8 @@ def main(stdscr):
             note_training(stdscr)
         elif mode == "chord":
             chord_training(stdscr)
+        elif mode == "key":
+            key_training(stdscr)
 
 
 if __name__ == "__main__":

@@ -347,6 +347,62 @@ def _generate_chord_wav_fallback(midi_notes):
     return _build_wav(raw)
 
 
+def _generate_progression_wav_fallback(chord_sequence, chord_duration=1.0):
+    """Generate a progression WAV using additive synthesis (no FluidSynth)."""
+    all_raw = b""
+    num_samples_per_chord = int(SAMPLE_RATE * chord_duration)
+
+    for midi_notes in chord_sequence:
+        note_samples_list = []
+        for midi_note in midi_notes:
+            freq = midi_to_freq(midi_note)
+            ns = _synthesize_note(freq, chord_duration, AMPLITUDE / len(midi_notes))
+            if len(ns) < num_samples_per_chord:
+                ns.extend([0.0] * (num_samples_per_chord - len(ns)))
+            note_samples_list.append(ns[:num_samples_per_chord])
+
+        for i in range(num_samples_per_chord):
+            val = sum(ns[i] for ns in note_samples_list)
+            clamped = max(-1.0, min(1.0, val))
+            all_raw += struct.pack("<h", int(clamped * 32767))
+
+    return _build_wav(all_raw)
+
+
+def _build_progression_midi(chord_sequence, chord_duration, program=0):
+    """Build a MIDI file with a sequence of chords played one after another."""
+    ticks_per_beat = 480
+    tempo = 500000  # 120 BPM => 1 beat = 0.5s
+    duration_ticks = int(ticks_per_beat * 2 * chord_duration)
+
+    track_data = b""
+    # Tempo meta event
+    track_data += b"\x00\xff\x51\x03" + tempo.to_bytes(3, "big")
+    # Program change
+    track_data += b"\x00\xc0" + bytes([program & 0x7f])
+
+    for chord_idx, midi_notes in enumerate(chord_sequence):
+        # Note on for all notes in this chord (delta=0)
+        for note in midi_notes:
+            track_data += b"\x00\x90" + bytes([note & 0x7f, 100])
+
+        # Note off after duration (first note gets the delta, rest get 0)
+        for i, note in enumerate(midi_notes):
+            delta = _write_var_len(duration_ticks) if i == 0 else b"\x00"
+            track_data += delta + b"\x80" + bytes([note & 0x7f, 0])
+
+    # End of track
+    track_data += b"\x00\xff\x2f\x00"
+
+    header = b"MThd" + struct.pack(">I", 6) + struct.pack(">HHH", 0, 1, ticks_per_beat)
+    track = b"MTrk" + struct.pack(">I", len(track_data)) + track_data
+
+    fd, path = tempfile.mkstemp(suffix=".mid")
+    with os.fdopen(fd, "wb") as f:
+        f.write(header + track)
+    return path
+
+
 # ── Public API ────────────────────────────────────────────────────────
 
 def generate_wav(midi_note, instrument=None):
@@ -388,6 +444,28 @@ def generate_chord_wav(midi_notes, instrument=None):
             return wav_path
     # Fallback
     return _generate_chord_wav_fallback(midi_notes)
+
+
+def generate_progression_wav(chord_sequence, instrument=None, chord_duration=1.0):
+    """Generate a WAV file for a chord progression.
+
+    Args:
+        chord_sequence: List of lists of MIDI note numbers (one list per chord).
+        instrument: Index into INSTRUMENTS list, or None for fallback synth.
+        chord_duration: Duration of each chord in seconds.
+    """
+    if not chord_sequence:
+        return generate_wav(60, instrument)
+
+    if instrument is not None and fluidsynth_available():
+        program = INSTRUMENTS[instrument][0]
+        sf2 = get_soundfont()
+        midi_path = _build_progression_midi(chord_sequence, chord_duration, program)
+        wav_path = _render_midi_to_wav(midi_path, sf2)
+        if wav_path:
+            return wav_path
+    # Fallback
+    return _generate_progression_wav_fallback(chord_sequence, chord_duration)
 
 
 def play_wav_async(path):

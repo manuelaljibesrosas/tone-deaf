@@ -1,3 +1,4 @@
 **/__pycache__/
 soundfonts/*.sf2
 soundfonts/*.sf3
+settings.db
