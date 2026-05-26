@@ -50,18 +50,20 @@ def load_setting(key, default=None):
 
 # ── Convenience functions for ear trainer settings ────────────────────
 
-def save_note_training_config(enabled_pcs, instrument):
+def save_note_training_config(enabled_pcs, instrument, octave_mode=False):
     """Save note training configuration."""
     save_setting("note.enabled_pcs", list(enabled_pcs))
     save_setting("note.instrument", instrument)
+    save_setting("note.octave_mode", octave_mode)
 
 
 def load_note_training_config():
-    """Load note training configuration. Returns (enabled_pcs, instrument)."""
+    """Load note training configuration. Returns (enabled_pcs, instrument, octave_mode)."""
     pcs = load_setting("note.enabled_pcs")
     enabled_pcs = set(pcs) if pcs is not None else set(range(12))
     instrument = load_setting("note.instrument", None)
-    return enabled_pcs, instrument
+    octave_mode = load_setting("note.octave_mode", False)
+    return enabled_pcs, instrument, octave_mode
 
 
 def save_chord_training_config(enabled_chords, enabled_inversions, instrument):
