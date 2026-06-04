@@ -22,6 +22,7 @@ from synth import (
     NOTE_NAMES,
     fluidsynth_available,
     generate_chord_wav,
+    generate_arpeggio_wav,
     generate_progression_wav,
     generate_wav,
     instrument_range,
@@ -625,6 +626,11 @@ def chord_training(stdscr):
         path = generate_chord_wav(notes, instrument)
         play_wav_async(path)
 
+    def play_arpeggio():
+        notes = build_chord_midi(current_root, current_type, current_inv)
+        path = generate_arpeggio_wav(notes, instrument, note_duration=0.4)
+        play_wav_async(path)
+
     def check_answer():
         nonlocal correct, total, feedback, feedback_attr
         answer_type = type_options[answer_type_idx]
@@ -682,7 +688,7 @@ def chord_training(stdscr):
         safe_addstr(stdscr, row, x0 + 35, i_label, i_attr)
 
         safe_addstr(stdscr, y0 + BOX_H - 5, x0 + 2, "[Tab] field  [j/\u2193 k/\u2191] cycle  [Enter] submit")
-        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[R] replay  [N] chord selection")
+        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[R] replay  [A] arpeggio  [N] chords")
         safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, "[I] instrument")
         safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
         stdscr.refresh()
@@ -736,11 +742,10 @@ def chord_training(stdscr):
             play_current()
         elif key in (ord("r"), ord("R")):
             play_current()
+        elif key in (ord("a"), ord("A")):
+            play_arpeggio()
 
         render()
-
-
-# ── Progression definitions ────────────────────────────────────────────
 
 # Each progression is (name, [(semitone_offset_from_root, chord_quality), ...])
 MAJOR_PROGRESSIONS = [

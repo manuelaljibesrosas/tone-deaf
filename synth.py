@@ -468,6 +468,20 @@ def generate_progression_wav(chord_sequence, instrument=None, chord_duration=1.0
     return _generate_progression_wav_fallback(chord_sequence, chord_duration)
 
 
+def generate_arpeggio_wav(midi_notes, instrument=None, note_duration=0.4):
+    """Generate a WAV file that plays chord notes one at a time (arpeggio).
+
+    Args:
+        midi_notes: List of MIDI note numbers.
+        instrument: Index into INSTRUMENTS list, or None for fallback synth.
+        note_duration: Duration of each note in seconds.
+    """
+    if not midi_notes:
+        return generate_wav(60, instrument)
+    chord_sequence = [[n] for n in midi_notes]
+    return generate_progression_wav(chord_sequence, instrument, note_duration)
+
+
 def play_wav_async(path):
     """Play a WAV file asynchronously via paplay."""
     proc = subprocess.Popen(
