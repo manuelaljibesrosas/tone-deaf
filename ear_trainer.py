@@ -3,6 +3,7 @@
 
 import curses
 import random
+from datetime import datetime
 
 from config import (
     load_chord_training_config,
@@ -11,6 +12,7 @@ from config import (
     save_chord_training_config,
     save_key_training_config,
     save_note_training_config,
+    save_session,
 )
 from synth import (
     ACCIDENTAL_CYCLE,
@@ -404,33 +406,55 @@ def chord_selection_screen(stdscr, enabled_chords, enabled_inversions):
 # ── Note training mode ─────────────────────────────────────────────────
 
 def note_training(stdscr):
-    """Single-note ear training loop."""
-    saved_pcs, saved_instr, octave_mode = load_note_training_config()
+    """Note ear training loop. Plays a sequence of notes; the user identifies
+    each one in order, then sees per-note feedback after the full sequence."""
+    saved_pcs, saved_instr, octave_mode, sequence_length = load_note_training_config()
     enabled_pcs = saved_pcs
     instrument = saved_instr
     correct = 0
     total = 0
-    current_note = None
+    started_at = datetime.now().isoformat()
+
+    MAX_SEQ = 8
+    sequence_length = max(1, min(MAX_SEQ, sequence_length))
+
+    sequence_notes = []      # MIDI notes for the current challenge
+    answers = []             # submitted answers: list of (letter, accidental_idx, octave)
+    results = []             # per-note evaluation dicts (feedback phase)
+    answer_idx = 0           # which note is being answered
+    phase = "answering"      # "answering" or "feedback"
+
     answer_letter = ""
     accidental_idx = 0
-    answer_octave = None  # int 0-8 when octave_mode is on
-    feedback = ""
+    answer_octave = None     # int 0-8 when octave_mode is on
+    feedback = ""            # transient message (e.g. invalid input)
     feedback_attr = curses.A_NORMAL
 
     BOX_W = 50
-    BOX_H = 12
 
-    def pick_note():
-        nonlocal current_note
+    def pick_sequence():
+        nonlocal sequence_notes, answers, results, answer_idx, phase
+        nonlocal answer_letter, accidental_idx, answer_octave, feedback
         lo, hi = instrument_range(instrument)
-        while True:
-            n = random.randint(lo, hi)
-            if midi_to_pitch_class(n) in enabled_pcs:
-                current_note = n
-                return
+        notes = []
+        for _ in range(sequence_length):
+            while True:
+                n = random.randint(lo, hi)
+                if midi_to_pitch_class(n) in enabled_pcs:
+                    notes.append(n)
+                    break
+        sequence_notes = notes
+        answers = []
+        results = []
+        answer_idx = 0
+        phase = "answering"
+        answer_letter = ""
+        accidental_idx = 0
+        answer_octave = None
+        feedback = ""
 
-    def play_current():
-        path = generate_wav(current_note, instrument)
+    def play_sequence():
+        path = generate_arpeggio_wav(sequence_notes, instrument, note_duration=0.6)
         play_wav_async(path)
 
     def get_answer_str():
@@ -441,8 +465,10 @@ def note_training(stdscr):
             s += str(answer_octave) if answer_octave is not None else "_"
         return s
 
-    def check_answer():
-        nonlocal correct, total, feedback, feedback_attr
+    def submit_note():
+        """Validate and record the current note answer. Returns True if accepted."""
+        nonlocal answer_idx, answer_letter, accidental_idx, answer_octave
+        nonlocal feedback, feedback_attr
         answer = answer_letter + ACCIDENTAL_CYCLE[accidental_idx]
         if answer not in NAME_TO_PITCH_CLASS:
             feedback = "  Invalid note: " + answer
@@ -452,21 +478,66 @@ def note_training(stdscr):
             feedback = "  Enter octave (0-8)"
             feedback_attr = curses.A_BOLD
             return False
-        answer_pc = NAME_TO_PITCH_CLASS[answer]
-        actual_pc = midi_to_pitch_class(current_note)
-        actual_octave = (current_note - 12) // 12
-        total += 1
-        note_name = midi_to_name(current_note)
-        pc_correct = answer_pc == actual_pc
-        oct_correct = (not octave_mode) or (answer_octave == actual_octave)
-        if pc_correct and oct_correct:
-            correct += 1
-            feedback = f"  \u2713 Correct! It was {note_name}"
-        else:
-            you_said = answer + (str(answer_octave) if octave_mode else "")
-            feedback = f"  \u2717 Wrong! It was {note_name} (you said: {you_said})"
-        feedback_attr = curses.A_BOLD
+        answers.append((answer_letter, accidental_idx, answer_octave))
+        answer_idx += 1
+        answer_letter = ""
+        accidental_idx = 0
+        answer_octave = None
+        feedback = ""
+        if answer_idx >= sequence_length:
+            evaluate()
         return True
+
+    def evaluate():
+        """Score the full sequence and build feedback results."""
+        nonlocal correct, total, results, phase
+        results = []
+        for i, note in enumerate(sequence_notes):
+            letter, acc_idx, octv = answers[i]
+            answer = letter + ACCIDENTAL_CYCLE[acc_idx]
+            answer_pc = NAME_TO_PITCH_CLASS[answer]
+            actual_pc = midi_to_pitch_class(note)
+            actual_octave = (note - 12) // 12
+            pc_correct = answer_pc == actual_pc
+            oct_correct = (not octave_mode) or (octv == actual_octave)
+            is_correct = pc_correct and oct_correct
+            total += 1
+            if is_correct:
+                correct += 1
+            if octave_mode:
+                actual_str = midi_to_name(note)
+                answer_str = answer + (str(octv) if octv is not None else "")
+            else:
+                actual_str = NOTE_NAMES[actual_pc]
+                answer_str = answer
+            results.append({
+                "correct": is_correct,
+                "actual": actual_str,
+                "answer": answer_str,
+            })
+        phase = "feedback"
+
+    def feedback_lines():
+        """Wrap per-note result tokens into lines that fit the box interior."""
+        tokens = []
+        for r in results:
+            if r["correct"]:
+                tokens.append(f"\u2713{r['actual']}")
+            else:
+                tokens.append(f"\u2717{r['answer']}\u2192{r['actual']}")
+        iw = BOX_W - 6
+        lines = []
+        cur = ""
+        for tok in tokens:
+            piece = tok if not cur else cur + "  " + tok
+            if len(piece) > iw and cur:
+                lines.append(cur)
+                cur = tok
+            else:
+                cur = piece
+        if cur:
+            lines.append(cur)
+        return lines or ["(no answers)"]
 
     def instrument_label():
         if instrument is None:
@@ -483,79 +554,124 @@ def note_training(stdscr):
             pct = int(100 * correct / total)
             score_str = f"Score: {correct}/{total} {pct}%"
 
+        # Build body content lines as (text, attr)
+        body = []
+        oct_label = " [octave ON]" if octave_mode else ""
+        body.append((f"\u266a Listen...  ({instrument_label()})   [Len: {sequence_length}]",
+                     curses.A_NORMAL))
+        body.append(("", curses.A_NORMAL))
+
+        if phase == "answering":
+            prog = f"Note {answer_idx + 1}/{sequence_length}:  {get_answer_str()}{oct_label}"
+            body.append((prog, curses.A_NORMAL))
+            if feedback:
+                body.append((feedback, feedback_attr))
+        else:  # feedback
+            for line in feedback_lines():
+                body.append((line, curses.A_BOLD))
+
+        # Controls
+        if phase == "answering":
+            controls = [
+                "[A-G] note  [Tab] #/b  [Enter] next",
+                "[R] replay  [N] notes  [+/-] seq length",
+                f"[I] instrument  [O] octave mode{'  [0-8] octave' if octave_mode else ''}",
+                "[Esc] back to menu",
+            ]
+        else:
+            controls = [
+                "[Enter] next sequence  [R] replay",
+                "[N] notes  [+/-] seq length",
+                "[I] instrument  [O] octave mode",
+                "[Esc] back to menu",
+            ]
+
+        body_start = y0 + 3
+        gap_row = body_start + len(body)
+        controls_start = gap_row + 1
+        bottom = controls_start + len(controls)
+        BOX_H = bottom - y0 + 1
+
         draw_box(stdscr, y0, x0, BOX_H, BOX_W)
         draw_separator(stdscr, y0 + 2, x0, BOX_W)
-
         safe_addstr(stdscr, y0 + 1, x0 + 2, "NOTE TRAINER", curses.A_BOLD)
         safe_addstr(stdscr, y0 + 1, x0 + BOX_W - 2 - len(score_str), score_str)
 
-        row = y0 + 3
-        if feedback:
-            safe_addstr(stdscr, row, x0 + 2, feedback[:BOX_W - 4], feedback_attr)
-            row += 1
+        for i, (text, attr) in enumerate(body):
+            if text:
+                safe_addstr(stdscr, body_start + i, x0 + 2, text[:BOX_W - 4], attr)
 
-        safe_addstr(stdscr, row, x0 + 2, f"\u266a Listen...  ({instrument_label()})")
-        row += 2
-        oct_label = " [octave ON]" if octave_mode else ""
-        safe_addstr(stdscr, row, x0 + 2, f"Your answer:  {get_answer_str()}{oct_label}")
+        for i, text in enumerate(controls):
+            safe_addstr(stdscr, controls_start + i, x0 + 2, text)
 
-        safe_addstr(stdscr, y0 + BOX_H - 5, x0 + 2, "[A-G] note  [Tab] #/b  [Enter] submit")
-        safe_addstr(stdscr, y0 + BOX_H - 4, x0 + 2, "[R] replay  [N] note selection")
-        octave_hint = "  [0-9] octave" if octave_mode else ""
-        safe_addstr(stdscr, y0 + BOX_H - 3, x0 + 2, f"[I] instrument  [O] octave mode{octave_hint}")
-        safe_addstr(stdscr, y0 + BOX_H - 2, x0 + 2, "[Esc] back to menu")
         stdscr.refresh()
 
-    pick_note()
-    play_current()
+    def reset_and_restart():
+        nonlocal sequence_length
+        sequence_length = max(1, min(MAX_SEQ, sequence_length))
+        pick_sequence()
+        play_sequence()
+
+    pick_sequence()
+    play_sequence()
     render()
 
     while True:
         key = stdscr.getch()
 
         if key == 27:
-            save_note_training_config(enabled_pcs, instrument, octave_mode)
+            save_note_training_config(enabled_pcs, instrument, octave_mode, sequence_length)
+            if total > 0:
+                save_session(
+                    "note", started_at, datetime.now().isoformat(),
+                    correct, total, instrument,
+                    {
+                        "enabled_pcs": sorted(enabled_pcs),
+                        "octave_mode": octave_mode,
+                        "sequence_length": sequence_length,
+                    },
+                )
             return
         elif key in (ord("n"), ord("N")):
             enabled_pcs = note_selection_screen(stdscr, enabled_pcs)
-            save_note_training_config(enabled_pcs, instrument, octave_mode)
-            answer_letter = ""
-            accidental_idx = 0
-            answer_octave = None
-            feedback = ""
-            pick_note()
-            play_current()
+            save_note_training_config(enabled_pcs, instrument, octave_mode, sequence_length)
+            reset_and_restart()
         elif key in (ord("i"), ord("I")):
             instrument = instrument_selection_screen(stdscr, instrument)
-            save_note_training_config(enabled_pcs, instrument, octave_mode)
-            feedback = ""
-            pick_note()
-            play_current()
+            save_note_training_config(enabled_pcs, instrument, octave_mode, sequence_length)
+            reset_and_restart()
         elif key in (ord("o"), ord("O")):
             octave_mode = not octave_mode
-            answer_octave = None
-            save_note_training_config(enabled_pcs, instrument, octave_mode)
-        elif key == ord("\t"):
-            if answer_letter:
-                accidental_idx = (accidental_idx + 1) % 3
-        elif key in (ord("\n"), ord("\r")):
-            if answer_letter:
-                if check_answer():
-                    render()
-                    stdscr.refresh()
-                    curses.napms(1200)
-                    answer_letter = ""
-                    accidental_idx = 0
-                    answer_octave = None
-                    pick_note()
-                    play_current()
+            save_note_training_config(enabled_pcs, instrument, octave_mode, sequence_length)
+            reset_and_restart()
+        elif key in (ord("+"), ord("=")):
+            if sequence_length < MAX_SEQ:
+                sequence_length += 1
+                save_note_training_config(enabled_pcs, instrument, octave_mode, sequence_length)
+                reset_and_restart()
+        elif key in (ord("-"), ord("_")):
+            if sequence_length > 1:
+                sequence_length -= 1
+                save_note_training_config(enabled_pcs, instrument, octave_mode, sequence_length)
+                reset_and_restart()
         elif key in (ord("r"), ord("R")):
-            play_current()
-        elif octave_mode and ord("0") <= key <= ord("8"):
-            answer_octave = key - ord("0")
-        elif ord("a") <= key <= ord("g") or ord("A") <= key <= ord("G"):
-            answer_letter = chr(key).upper()
-            accidental_idx = 0
+            play_sequence()
+        elif phase == "answering":
+            if key == ord("\t"):
+                if answer_letter:
+                    accidental_idx = (accidental_idx + 1) % 3
+            elif key in (ord("\n"), ord("\r")):
+                if answer_letter:
+                    submit_note()
+            elif octave_mode and ord("0") <= key <= ord("8"):
+                answer_octave = key - ord("0")
+            elif ord("a") <= key <= ord("g") or ord("A") <= key <= ord("G"):
+                answer_letter = chr(key).upper()
+                accidental_idx = 0
+        elif phase == "feedback":
+            if key in (ord("\n"), ord("\r")):
+                pick_sequence()
+                play_sequence()
 
         render()
 
@@ -571,6 +687,7 @@ def chord_training(stdscr):
 
     correct = 0
     total = 0
+    started_at = datetime.now().isoformat()
     current_root = None
     current_type = None
     current_inv = None
@@ -702,6 +819,15 @@ def chord_training(stdscr):
 
         if key == 27:
             save_chord_training_config(enabled_chords, enabled_inversions, instrument)
+            if total > 0:
+                save_session(
+                    "chord", started_at, datetime.now().isoformat(),
+                    correct, total, instrument,
+                    {
+                        "enabled_chords": sorted(enabled_chords),
+                        "enabled_inversions": sorted(enabled_inversions),
+                    },
+                )
             return
         elif key in (ord("n"), ord("N")):
             enabled_chords, enabled_inversions = chord_selection_screen(
@@ -876,6 +1002,7 @@ def key_training(stdscr):
 
     correct = 0
     total = 0
+    started_at = datetime.now().isoformat()
     current_root_pc = None  # pitch class 0-11
     current_quality = None  # "major" or "minor"
     current_prog_name = None
@@ -999,6 +1126,12 @@ def key_training(stdscr):
 
         if key == 27:
             save_key_training_config(enabled_progressions, instrument)
+            if total > 0:
+                save_session(
+                    "key", started_at, datetime.now().isoformat(),
+                    correct, total, instrument,
+                    {"enabled_progressions": sorted(enabled_progressions)},
+                )
             return
         elif key in (ord("n"), ord("N")):
             enabled_progressions = progression_selection_screen(
