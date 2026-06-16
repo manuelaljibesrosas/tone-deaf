@@ -2,3 +2,6 @@
 soundfonts/*.sf2
 soundfonts/*.sf3
 settings.db
+
+/melody_proto/weights
+melody_proto/venv*/
